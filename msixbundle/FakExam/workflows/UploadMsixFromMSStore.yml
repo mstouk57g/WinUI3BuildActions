@@ -1,0 +1,413 @@
+name: Process Draft Releases with MSIX
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  get-draft-releases:
+    runs-on: ubuntu-latest
+    outputs:
+      version-list: ${{ steps.get-drafts.outputs.version-list }}
+      version-count: ${{ steps.get-drafts.outputs.version-count }}
+      has-drafts: ${{ steps.get-drafts.outputs.has-drafts }}
+
+    steps:
+    - name: Get draft releases
+      id: get-drafts
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: releases } = await github.rest.repos.listReleases({
+            owner: context.repo.owner,
+            repo: context.repo.repo
+          });
+
+          const draftReleases = releases.filter(release => release.draft);
+          console.log(`Found ${draftReleases.length} draft releases`);
+
+          if (draftReleases.length === 0) {
+            console.log('No draft releases found - this is normal, skipping subsequent steps');
+            core.setOutput('has-drafts', 'false');
+            core.setOutput('version-list', '[]');
+            core.setOutput('version-count', '0');
+            return;
+          }
+
+          const versions = draftReleases.map(release => {
+            if (!release.tag_name) {
+              console.log(`Warning: Draft release ${release.id} has empty tag_name, skipping`);
+              return null;
+            }
+
+            const version = release.tag_name;
+            if (!version || version.trim() === '') {
+              console.log(`Warning: Draft release ${release.id} tag_name '${release.tag_name}' becomes empty, skipping`);
+              return null;
+            }
+
+            if (!/^[\d.]+$/.test(version)) {
+              console.log(`Warning: Draft release ${release.id} version '${version}' has invalid format, skipping`);
+              return null;
+            }
+
+            console.log(`Valid version found: ${version} (from tag: ${release.tag_name})`);
+            return version;
+          }).filter(version => version !== null);
+
+          console.log('Valid draft release versions (without v prefix):', versions);
+          console.log(`Total valid versions: ${versions.length}`);
+
+          if (versions.length === 0) {
+            console.log('No valid draft releases found after filtering - skipping subsequent steps');
+            core.setOutput('has-drafts', 'false');
+            core.setOutput('version-list', '[]');
+            core.setOutput('version-count', '0');
+            return;
+          }
+
+          core.setOutput('has-drafts', 'true');
+          core.setOutput('version-list', JSON.stringify(versions));
+          core.setOutput('version-count', versions.length.toString());
+
+  build-storelib:
+    needs: get-draft-releases
+    if: needs.get-draft-releases.outputs.has-drafts == 'true'
+    runs-on: windows-latest
+    outputs:
+      storelib-ready: ${{ steps.build.outputs.storelib-ready }}
+    steps:
+    - name: Checkout StoreLib
+      uses: actions/checkout@v4
+      with:
+        repository: 'StoreDev/StoreLib'
+        path: 'StoreLib'
+        fetch-depth: 1
+
+    - name: Setup .NET 7.0
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '7.0.x'
+
+    - name: Build StoreLib.Cli
+      id: build
+      shell: pwsh
+      run: |
+        cd StoreLib
+        dotnet build StoreLib.Cli -c Release
+        Write-Host "✓ StoreLib.Cli 编译完成"
+        echo "storelib-ready=true" >> $env:GITHUB_OUTPUT
+
+    - name: Upload StoreLib.Cli artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: storelib-cli
+        path: StoreLib/StoreLib.Cli/bin/Release/net7.0/
+        retention-days: 1
+
+  get-msix-package:
+    needs: [get-draft-releases, build-storelib]
+    if: needs.get-draft-releases.outputs.has-drafts == 'true'
+    strategy:
+      matrix:
+        version: ${{ fromJSON(needs.get-draft-releases.outputs.version-list) }}
+      fail-fast: false
+    runs-on: windows-latest
+    outputs:
+      msix-filename: ${{ steps.prepare-file.outputs.final-filename }}
+      version: ${{ matrix.version }}
+
+    steps:
+    - name: Download StoreLib.Cli artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: storelib-cli
+        path: StoreLib/
+
+    - name: Setup .NET 7.0
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '7.0.x'
+
+    - name: Verify StoreLib.Cli
+      shell: pwsh
+      run: |
+        $storelibPath = "StoreLib/StoreLib.Cli.exe"
+        if (Test-Path $storelibPath) {
+            Write-Host "✓ StoreLib.Cli 已就绪"
+        } else {
+            Write-Error "StoreLib.Cli 不存在: $storelibPath"
+            exit 1
+        }
+
+    - name: Get MSIX bundle download link via StoreLib
+      id: get-download-link
+      shell: pwsh
+      env:
+        PRODUCT_ID: ${{ secrets.PRODUCT_ID }}
+      run: |
+        $appId = "$env:PRODUCT_ID"
+        $tagVersion = "${{ matrix.version }}"
+
+        Write-Host "正在为 App ID: $appId 获取包信息"
+        Write-Host "目标版本: $tagVersion"
+
+        # 运行 StoreLib.Cli 获取包信息
+        $storelibPath = "StoreLib/StoreLib.Cli.exe"
+        $output = & $storelibPath packages $appId
+
+        # 匹配 MSIX bundle 文件
+        $pattern = '\[(mstouk57g\.FakExam_[\d.]+_neutral_~_px9fbtkyzyrzy\.Msixbundle)\]\(([^\)]+)\):\s+[\d.]+[MG]B'
+        $matches = [regex]::Matches($output, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+        if ($matches.Count -eq 0) {
+            Write-Error "未找到任何 MSIX bundle 下载链接"
+            Write-Host "请检查 PRODUCT_ID 是否正确"
+            exit 1
+        }
+
+        Write-Host "找到 $($matches.Count) 个 MSIX bundle 文件"
+
+        $foundFile = $null
+        $foundUrl = $null
+        $foundVersion = $null
+
+        # 遍历所有找到的 MSIX bundle 文件
+        foreach ($match in $matches) {
+            $fileName = $match.Groups[1].Value
+            $downloadUrl = $match.Groups[2].Value
+
+            Write-Host "检查文件: $fileName"
+
+            # 从文件名提取版本号
+            if ($fileName -match '_([\d.]+)_') {
+                $fileVersion = $matches[1]
+                Write-Host "  提取到版本: $fileVersion"
+
+                if ($fileVersion -eq $tagVersion) {
+                    Write-Host "  ✓ 找到匹配版本!"
+                    $foundFile = $fileName
+                    $foundUrl = $downloadUrl
+                    $foundVersion = $fileVersion
+                    break
+                } else {
+                    Write-Host "  版本不匹配, 需要: $tagVersion"
+                }
+            } else {
+                Write-Host "  无法从文件名提取版本号"
+            }
+        }
+
+        # 验证是否找到匹配的版本
+        if (-not $foundFile) {
+            Write-Error "未找到版本 $tagVersion 的 MSIX bundle 下载链接"
+            Write-Host "可用的版本:"
+            foreach ($match in $matches) {
+                $fileName = $match.Groups[1].Value
+                if ($fileName -match '_([\d.]+)_') {
+                    $availableVersion = $matches[1]
+                    Write-Host "  - $availableVersion"
+                }
+            }
+            exit 1
+        }
+
+        Write-Host "成功找到匹配的 MSIX bundle:"
+        Write-Host "  版本: $foundVersion"
+        Write-Host "  文件名: $foundFile"
+        Write-Host "  下载URL: $foundUrl"
+
+        # 保存输出
+        echo "download-url=$foundUrl" >> $env:GITHUB_OUTPUT
+        echo "filename=$foundFile" >> $env:GITHUB_OUTPUT
+
+        Write-Host "✓ 成功获取下载链接"
+
+    - name: Download MSIX bundle
+      shell: pwsh
+      run: |
+        $downloadUrl = "${{ steps.get-download-link.outputs.download-url }}"
+        Write-Host "正在下载: $downloadUrl"
+
+        # 下载文件
+        Invoke-WebRequest -Uri $downloadUrl -OutFile "temp-package.msixbundle" -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+        # 验证下载
+        if (Test-Path "temp-package.msixbundle") {
+            $fileSize = (Get-Item "temp-package.msixbundle").Length
+            Write-Host "✓ 成功下载 MSIX 包，大小: $([math]::Round($fileSize/1MB, 2)) MB"
+        } else {
+            Write-Error "下载失败"
+            exit 1
+        }
+
+    - name: Parse MSIX version
+      id: parse-msix-version
+      shell: pwsh
+      run: |
+        # 解析 MSIX 包版本
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+        $zipPath = "temp-package.msixbundle.zip"
+        Copy-Item "temp-package.msixbundle" $zipPath
+
+        $tempDir = "msix-extract"
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+        try {
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $tempDir)
+
+            $manifestPath = Join-Path $tempDir 'AppxManifest.xml'
+            if (Test-Path $manifestPath) {
+                [xml]$manifest = Get-Content $manifestPath
+                $msixVersion = $manifest.Package.Identity.Version
+                Write-Host "MSIX package version: $msixVersion"
+                echo "msix-version=$msixVersion" >> $env:GITHUB_OUTPUT
+            } else {
+                Write-Warning "未找到 AppxManifest.xml，使用文件名中的版本"
+                $fileName = "${{ steps.get-download-link.outputs.filename }}"
+                if ($fileName -match '_([\d.]+)_') {
+                    $msixVersion = $matches[1]
+                    Write-Host "从文件名提取版本: $msixVersion"
+                    echo "msix-version=$msixVersion" >> $env:GITHUB_OUTPUT
+                } else {
+                    Write-Error "无法解析版本号"
+                    exit 1
+                }
+            }
+        }
+        finally {
+            # 清理临时文件
+            if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+        }
+
+    - name: Compare versions and rename file
+      id: prepare-file
+      shell: pwsh
+      run: |
+        $tagVersion = "${{ matrix.version }}"
+        $msixVersion = "${{ steps.parse-msix-version.outputs.msix-version }}"
+
+        Write-Host "Release tag version: $tagVersion"
+        Write-Host "MSIX package version: $msixVersion"
+
+        if ($tagVersion -ne $msixVersion) {
+          Write-Warning "版本不匹配! 输入版本: $tagVersion, MSIX 实际版本: $msixVersion"
+        } else {
+          Write-Host "✓ 版本匹配确认: $tagVersion"
+        }
+
+        # 生成最终文件名
+        $finalFileName = "mstouk57g.FakExam_${tagVersion}_x64__px9fbtkyzyrzy.msixbundle"
+
+        if (Test-Path "temp-package.msixbundle") {
+            Move-Item -Path "temp-package.msixbundle" -Destination $finalFileName -Force
+            Write-Host "✓ 文件已重命名为: $finalFileName"
+        } else {
+            Write-Error "找不到临时文件 temp-package.msixbundle"
+            exit 1
+        }
+
+        echo "final-filename=$finalFileName" >> $env:GITHUB_OUTPUT
+
+    - name: Upload MSIX artifact with version
+      uses: actions/upload-artifact@v4
+      with:
+        name: msix-${{ matrix.version }}
+        path: ${{ steps.prepare-file.outputs.final-filename }}
+        if-no-files-found: error
+
+  check-available-artifacts:
+    needs: [get-draft-releases, get-msix-package]
+    if: needs.get-draft-releases.outputs.has-drafts == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      available-versions: ${{ steps.check-artifacts.outputs.available-versions }}
+      available-count: ${{ steps.check-artifacts.outputs.available-count }}
+      has-available: ${{ steps.check-artifacts.outputs.has-available }}
+    steps:
+    - name: Check which artifacts are available
+      id: check-artifacts
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const allVersions = ${{ needs.get-draft-releases.outputs.version-list }};
+          const availableVersions = [];
+
+          console.log('Checking available artifacts for versions:', allVersions);
+
+          try {
+            const { data: artifacts } = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+
+            const currentRunArtifacts = artifacts.artifacts.filter(artifact =>
+              artifact.workflow_run && artifact.workflow_run.id === context.runId
+            );
+
+            console.log(`Current run artifacts: ${currentRunArtifacts.map(a => a.name).join(', ')}`);
+
+            for (const version of allVersions) {
+              const artifactName = `msix-${version}`;
+              const exists = currentRunArtifacts.some(artifact => artifact.name === artifactName);
+
+              if (exists) {
+                console.log(`✓ Artifact found for version: ${version}`);
+                availableVersions.push(version);
+              } else {
+                console.log(`✗ Artifact not found for version: ${version} - this is normal if MSIX is not yet available in Store`);
+              }
+            }
+
+            console.log(`Available versions with artifacts: ${availableVersions.length}/${allVersions.length}`);
+            console.log('Available versions:', availableVersions);
+
+            if (availableVersions.length === 0) {
+              console.log('No artifacts available for any version - this is normal, skipping release');
+              core.setOutput('has-available', 'false');
+              core.setOutput('available-versions', '[]');
+              core.setOutput('available-count', '0');
+              return;
+            }
+
+            core.setOutput('has-available', 'true');
+            core.setOutput('available-versions', JSON.stringify(availableVersions));
+            core.setOutput('available-count', availableVersions.length.toString());
+
+          } catch (error) {
+            console.log('Error checking artifacts:', error);
+            console.log('Artifact check failed - this is not critical, skipping release');
+            core.setOutput('has-available', 'false');
+            core.setOutput('available-versions', '[]');
+            core.setOutput('available-count', '0');
+          }
+
+  release-matrix:
+    needs: [get-draft-releases, check-available-artifacts]
+    if: needs.get-draft-releases.outputs.has-drafts == 'true' && needs.check-available-artifacts.outputs.has-available == 'true'
+    strategy:
+      matrix:
+        version: ${{ fromJSON(needs.check-available-artifacts.outputs.available-versions) }}
+      fail-fast: false
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ matrix.version }}
+      mode: 'publish_only'
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  success-message:
+    needs: [get-draft-releases, get-msix-package, check-available-artifacts]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Display completion message
+      run: |
+        echo "✅ Workflow completed successfully"
+        echo "Draft releases found: ${{ needs.get-draft-releases.outputs.has-drafts == 'true' && 'Yes' || 'No' }}"
+        echo "MSIX artifacts available: ${{ needs.check-available-artifacts.outputs.has-available == 'true' && 'Yes' || 'No' }}"
+        echo "This is a check workflow - it's normal to have no drafts or no available MSIX packages"
